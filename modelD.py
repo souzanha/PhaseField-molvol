@@ -1,0 +1,759 @@
+"""
+Spinodal decomposition model by Souzan Hammadi & Nana Ofori-Opoku
+
+Fields in F:
+
+0. 𝔽: function space
+1. 𝐹: Helmholtz free energy
+2. x₁: composition of c1
+3. |∇c|²: squared gradient of concentration
+4. f(c): thermodynamic energy density
+
+Read input parameters & settings from `config.py`
+Output runtime values to `record.yml`
+"""
+from __future__ import print_function
+
+# === Basic performance monitoring ===
+
+import time
+
+startTime = time.time()
+
+# === System libraries ===
+import gc
+import numpy as np
+import os
+import pandas as pd
+import ruamel.yaml
+
+# import steppyngstounes as stp
+import sys
+
+# === Dolfin/FEniCS ===
+
+import ufl as ufl
+import dolfin as df
+
+# === AMR and other secret sauce ===
+
+import amr_fenics.input_output as io
+import amr_fenics.mesh_domain_funcs as mdf
+import amr_fenics.solver_funcs as slf
+import amr_fenics.helpers as hlp
+import amr_fenics.mesh_refinement as amr
+import amr_fenics.utility as ut
+
+# === Job Parameters ==
+from config import Adapt, Domain, Interval, Model, Solver, PetscOpt
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OMPI_ALLOW_RUN_AS_ROOT"] = "1"
+pd.set_option("display.width", 1000)
+pd.set_option("display.max_columns", None)
+pd.set_option("display.float_format", "{:.4f}".format)
+
+run = "." if len(sys.argv) < 2 else sys.argv[1]
+restartFlag = os.path.isfile("{}/restart.h5".format(run)) #==True
+
+if restartFlag:
+    restart_run = sys.argv[2]
+    fs = io.output_directory(restart_run, "solution")
+    fs_fine = io.output_directory(restart_run, "fine_solution")
+    nrg_file = restart_run + "/" + "ene.csv"
+else:
+    fs =  io.output_directory(run, "solution")
+    fs_fine = io.output_directory(run, "fine_solution")
+    nrg_file = run + "/" + "ene.csv"
+
+names = [r"$c$1", r"$c$2", r"$\mu$1", r"$\mu$2"]
+auxnames = [r"$\mathcal{F}$", r"$\Delta x1$", r"$x1$", r"$\mathcal{P}$"]
+
+record = {"data": {}, "domain": {}, "model": {}, "runtime": {}, "adapt": {}}
+
+stats_head = [
+    "time",  # "simulation time, dimensionless"
+    "dt", #timestep, dimensionless
+    "c1",  # "Li composition, whole domain"
+    "c2",  # "Li composition, whole domain"
+    "μ1",  # average chemical potential
+    "μ2",  # average chemical potential
+    "Helmholtz",  # "Helmholtz free energy, ∫F·dx"
+    "wall_time",  # "runtime (sec)"
+    #"mem_GB",  # "current memory usage (GB)"
+    #"peak_GB",  # "maximum memory usage (GB)"
+]
+
+record["data"]["stats"] = {}
+record["data"]["stats"]["file"] = nrg_file
+record["data"]["stats"]["cols"] = stats_head
+
+# === Runtime configuration ===
+
+# Solver options
+BDF2 = Solver["BDF2"]
+dt = df.Constant(Interval["timestep"])  # time step
+dt_max = Interval["maxtimestep"]  # maximum time step
+t_interval_output = Interval["time_interval_output"]  # time interval output
+cback = Interval["cutback"]  # reduction of time step
+growth = Interval["growth"]  # growth of time step
+min_its = Interval["min_iter"]  # minimum nonlinear iterations
+max_its = Interval["max_iter"]  # maximum nonlinear iterations
+checkpoint_frequency = Interval["f_checkpoint"]  # checkpoint frequency
+
+D11 = record["model"]["D11"] = float(Model["D11"])  # diff coeff [m²/s]
+D22 = record["model"]["D22"] = float(Model["D22"])  # diff coeff [m²/s]
+
+alpha = record["model"]["alpha"] = Model["alpha"]  # coupling constant mobility []
+
+σ = record["model"]["σ"] = Model["sigma"]  # surface energy
+Wc = record["model"]["Wc"] = Model["Wc"]  # length scale
+
+tc = record["model"]["tc"] = Wc**2 / D11  # time scale
+To = record["model"]["To"] = Model["To"]  # temperature
+
+v1 = record["model"]["v1"] = Model["v1"]  # molar volume
+v2 = record["model"]["v2"] = Model["v2"]  # molar volume
+vm = record["model"]["vm"] = Model["vm"]  # molar volume
+
+v1m = v1 / vm
+v2m = v2 / vm
+
+R = record["model"]["R"] = Model["R"]  # gas constant
+RTv = R * To / vm
+Om = record["model"]["Ω"] = Model["Omega"]  # enthalpy of mixing coeff
+
+Δf = -RTv * df.ln(2) + Om / vm / 4  # energy barrier scale [J/m³]
+
+H = record["model"]["H"] = σ / Wc  # energy scale
+
+E = record["model"]["E"] = Model["E"]  # Young's modulus
+ν = record["model"]["ν"] = Model["ν"]  # Poisson's ratio
+n = record["model"]["n"] = Model["n"]  # linear expansion coefficient
+co = record["model"]["co"] = Model["co"]  # average concentration
+
+Em = E / H
+
+Km = Em / (3 - (6 * ν))
+
+# === Non-dimensionalize model parameters ===
+T = record["runtime"]["tfinal"] = Interval["runtime"] / tc  # total time (max)
+
+io.disp("Critical & controlling parameters:")
+io.disp(f"     Δf={Δf:<12g}    H={H:<12g}")
+io.disp(f"     D11={D11:<12g}")
+io.disp(f"     t={tc:<12g}     T={T:<12g}")
+
+# === Define the mesh, size & resolution ===
+
+"""
+The program starts with a coarse mesh, and refines it — dividing the
+element size by two — until the target element size is reached.
+A heuristic sense is that 5 to 8 levels of refinement delivers a
+good mesh, meaning the starting point (emax) depends on the goal (nde):
+
+    emax = nde * 2ʳ⁻¹ = 64 * nde where r is the resolution in this case 7
+"""
+emax = record["domain"]["emax"] = Domain["emax"]
+Lx = record["domain"]["Lx"] = Domain["Lx"]  # domain length
+Ly = record["domain"]["Ly"] = Domain["Ly"]  # domain width
+Lz = record["domain"]["Lz"] = Domain["Lz"]  # domain width
+
+Nx = record["domain"]["Nx"] = int(Lx / emax)  # number of initial elements x-dir
+Ny = record["domain"]["Ny"] = int(Ly / emax)  # number of initial elements y-dir
+
+if Lz is not None:
+    Nz = record["domain"]["Ny"] = int(Lz / emax)  # number of initial elements y-dir
+
+emin = record["domain"]["emin"] = Domain["nde"]
+
+io.disp(f"     smallest element, cartesian distance(i.e. Δx)={emin}")
+
+# dimensionless entropy of mixing coefficient
+RTv = record["model"]["RTv"] = RTv / H
+
+# dimensionless enthalphy of mixing
+Om = Om / vm / H
+
+# Diffusion coefficient
+D11m = record["model"]["D11m"] = D11 * (tc / Wc**2)  # dimensionless
+D22m = record["model"]["D22m"] = D22 * (tc / Wc**2)  # dimensionless
+
+io.disp(f"     RTv={RTv:<12g}")
+io.disp(f"     D11m={D11m:<11g}")
+
+# setting some backend parameters and PETSc solver options directions
+slf.set_backend(Domain, PetscOpt)
+
+# Class representing the intial conditions
+class InitialConditions(df.UserExpression):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        np.random.seed(19960517)
+
+    def eval(self, values, x):
+        c = 0.5 + 0.1 * (0.5 - np.random.random())
+        values[0] = c     # concentration
+        values[1] = 1 - c # concentration
+        values[2] = 0.0   # chemical potential
+        values[3] = 0.0   # chemical potential
+
+    def value_shape(self):
+        return(4,)
+
+def plog(c, tol):
+    Δc = c - tol
+
+    t0 = df.ln(tol)
+    t1 = Δc / tol
+    t2 = -(Δc**2) / (2 * tol**2)
+    t3 = Δc**3 / (3 * tol**3)
+
+    return ufl.conditional(ufl.lt(c, tol), t0 + t1 + t2 + t3, df.ln(c))
+
+def fchem(rtv, om, c1, c2):
+    x1 = c1 / (c1 + c2)
+    x2 = c2 / (c1 + c2)
+    entropy = rtv * (x1 * plog(x1, 1e-3) + x2 * plog(x2, 1e-3))
+    enthalpy = om * x1 * x2
+
+    return entropy + enthalpy
+
+def fcahn(Em, n, ν, co, c):
+    fcahn = ((Em * n**2) / (1 - ν)) * (c - co)**2
+    return fcahn
+
+def ael(Km, v1m, v2m, c1, c2):
+    Δel = 1 / ((c1 * v1m) + (c2 * v2m))
+
+    ael = (1 / Δel) * (Km / 2) * df.ln(Δel)**2
+
+    P = - (Km / Δel) * df.ln(Δel)
+
+    return ael, P
+
+def equation_solve(U, U0, ME, mesh, element, dt, BDF2, time_bdf2):
+    # Split mixed functions
+    c1, c2, mu1, mu2 = df.split(U)
+    c10, c20, mu10, mu20 = df.split(U0[0])
+
+    if BDF2:
+        c100, c200, mu100, mu200 = df.split(U0[1])
+
+    q, qq, v, vv = df.TestFunctions(ME)
+
+    nME = df.FunctionSpace(mesh, element)
+    c1v = df.Function(nME)
+    c1_v = df.variable(c1v)
+    c2v = df.Function(nME)
+    c2_v = df.variable(c2v)
+
+    replacement = {c1v: c1, c2v: c2}
+
+    fel, P = ael(Km, v1m, v2m, c1_v, c2_v)
+
+    fdens = fchem(RTv, Om, c1_v, c2_v) + fel
+
+    #dfdc1 = df.diff(fdens, c1_v)
+    #dfdc2 = df.diff(fdens, c2_v)
+    #dμdc1 = ufl.replace(df.diff(dfdc1, c1_v), replacement)
+    #dμdc2 = ufl.replace(df.diff(dfdc2, c2_v), replacement)
+
+    dμdc1 = (6 * c1 * c2 * Om)/(c1 + c2)**4 - (4 * c2 * Om)/(c1 + c2)**3 + (c2 * RTv)/(c1 * (c1 + c2)**2) + (Km * v1m**2)/(c1 * v1m + c2 * v2m) - (2 * c2 * RTv * plog(c1/(c1 + c2),1e-3))/(c1 + c2)**3 + (2 * c2 * RTv * plog(c2/(c1 + c2),1e-3))/(c1 + c2)**3 - (Km * v1m**2 * plog(1/(c1 * v1m + c2 * v2m),1e-3))/(c1 * v1m + c2 * v2m)
+
+    dμdc2 = (6 * c1 * c2 * Om)/(c1 + c2)**4 - (4 * c1 * Om)/(c1 + c2)**3 + (c1 * RTv)/(c2 * (c1 + c2)**2) + (Km * v2m**2)/(c1 * v1m + c2 * v2m) + (2 * c1 * RTv * plog(c1/(c1 + c2),1e-3))/(c1 + c2)**3 - (2 * c1 * RTv * plog(c2/(c1 + c2),1e-3))/(c1 + c2)**3 - (Km * v2m**2 * plog(1/(c1 * v1m + c2 * v2m),1e-3))/(c1 * v1m + c2 * v2m)
+
+    M11 = D11m / df.sqrt(dμdc1**2 + 1e-6)
+    M22 = D22m / df.sqrt(dμdc2**2 + 1e-6)
+    M12 = df.Constant(alpha) * df.sqrt(M11 * M22)
+    M21 = M12
+
+    fgrad = (1 / 2) * df.inner(df.grad(c1_v / (c1_v + c2_v)), df.grad(c1_v / (c1_v + c2_v)))
+ 
+    Func = fgrad + fdens
+
+    μ1ₘ = (1.0 - Solver["theta"]) * mu10 + Solver["theta"] * mu1  # mu_(n+theta)
+    μ2ₘ = (1.0 - Solver["theta"]) * mu20 + Solver["theta"] * mu2  # mu_(n+theta)
+    # Weak statement of the equations
+
+    # Linear equation for c -> ∫ ∂c/∂t vₜₑₛₜ  = D(c)∇μ⋅∇vₜₑₛₜ + JBV⋅n̂ vₜₑₛₜ
+    rhs_c1 = -M11 * df.inner(df.grad(μ1ₘ), df.grad(q)) * df.dx #- M12 * df.inner(df.grad(μ2ₘ), df.grad(qq)) * df.dx
+    rhs_c2 = -M22 * df.inner(df.grad(μ2ₘ), df.grad(qq)) * df.dx # - M21 * df.inner(df.grad(μ1ₘ), df.grad(q)) * df.dx
+
+    if BDF2:
+        L_c1 = slf.set_bdf2(c1, c10, c100, q, time_bdf2, rhs_c1)
+        L_c2 = slf.set_bdf2(c2, c20, c200, qq, time_bdf2, rhs_c2)
+    else:
+        L_c1 = slf.set_bdf1(c1, c10, q, dt, rhs_c1)
+        L_c2 = slf.set_bdf1(c2, c20, qq, dt, rhs_c2)
+
+    # Linear equation for mu -> ∫ μ*vₜₑₛₜ = δF/δc⋅vₜₑₛₜ
+    dF1 = df.derivative(Func, c1v, v)
+    dF2 = df.derivative(Func, c2v, vv)
+    rhs_mu1 = ufl.replace(dF1, replacement) * df.dx
+    rhs_mu2 = ufl.replace(dF2, replacement) * df.dx
+
+    L_mu1 = mu1 * v * df.dx - rhs_mu1
+    L_mu2 = mu2 * vv * df.dx - rhs_mu2
+
+    L = L_c1 + L_c2 + L_mu1 + L_mu2
+
+    fgradc = df.sqrt(df.inner(df.grad(c1/(c1+c2)), df.grad(c1/(c1+c2))))
+
+    Func = ufl.replace(Func, replacement)
+
+    P = ufl.replace(P, replacement)
+
+    conc = c1 / (c1 + c2)
+
+    return L, Func, fgradc, conc, P
+
+def boundaries(mesh, V, bcs):
+    # BOUNDARY CONDITIONS
+    boundaries = df.MeshFunction("size_t", mesh, mesh.topology().dim() - 1)
+    boundaries.set_all(0)
+
+    # 100 -  surfaces
+    left = mdf.xboundary(0)
+    right = mdf.xboundary(Lx)
+
+    left.mark(boundaries, 1)
+    right.mark(boundaries, 2)
+
+    # 010 - surfaces
+    bottom = mdf.yboundary(0)
+    top = mdf.yboundary(Ly)
+
+    bottom.mark(boundaries, 3)
+    top.mark(boundaries, 4)
+
+    # 001 - surfaces
+    if Lz is not None:
+        back = mdf.zboundary(0)
+        front = mdf.zboundary(Lz)
+
+        back.mark(boundaries, 5)
+        front.mark(boundaries, 6)
+
+    return bcs
+
+def update_stats(t, dt, F, U, stats_df):
+    c1, c2, mu1, mu2 = df.split(U)
+
+    c1avg = ut.integrate_func(c1) / msize  # concentration average
+    c2avg = ut.integrate_func(c2) / msize  # concentration average
+    μ1avg = ut.integrate_func(mu1) / msize  # chemical potential average
+    μ2avg = ut.integrate_func(mu2) / msize  # chemical potential average
+    Favg = ut.integrate_func(F[0]) / msize  # Helmholtz free energy
+
+    #memUsed, memPeak = ut.memory_usage(as_string=False)
+
+    if hlp.isHead:
+        index = [0] if stats_df is None else [len(stats_df)]
+        timer = time.time() - startTime
+        values = np.array([[t * tc, dt * tc, c1avg, c2avg, μ1avg, μ2avg,Favg, timer]])#, memUsed, memPeak]])
+        update = pd.DataFrame(values, columns=stats_head, index=index)
+
+        if stats_df is None:
+            return update
+        else:
+            return pd.concat([stats_df, update])
+
+def output_stats(nrg_file, stats_df, report=False):
+    if hlp.isHead:
+        stats_df.to_csv(nrg_file, sep="\t", index=False)
+        if report:
+            latest = stats_df.iloc[-1]
+            io.disp("├─────────────────────────────────┐")
+            io.disp("│ comp c1      = {:<10.6f}".format(latest["c1"]))
+            io.disp("│ chem pot μ1  = {:<10.6f}".format(latest["μ1"]))
+            io.disp("│ enrg 𝓕       = {:<-10.5f}".format(latest["Helmholtz"]))
+            io.disp("├─────────────────────────────────┘")
+
+def output_data(t, F, U, fs, P1, mesh):
+    io.write_fields(U, t, names, fs)
+
+    for n, f in zip(auxnames, F):
+        if n == "$\sigma$":
+            if Lz is not None:
+                io.write_aux(
+                    f, t, n, df.TensorFunctionSpace(mesh, "DG", degree=0, shape=(6,)), fs)
+            else:
+                io.write_aux(
+                    f, t, n, df.TensorFunctionSpace(mesh, "DG", degree=0, shape=(3,)), fs)
+        else:
+            io.write_aux(f, t, n, df.FunctionSpace(mesh, P1), fs)
+
+if BDF2:
+    nprev = 2
+    time_bdf2 = [df.Constant(0), df.Constant(0), df.Constant(0)]
+else:
+    nprev = 1
+    time_bdf2 = None
+
+initStart = time.time()
+
+io.disp("┌─ Setting up simulation.")
+# Create mesh and build function space
+# Initial mesh
+
+if Lz is None:
+    imesh = df.RectangleMesh.create(
+        [df.Point(0, 0), df.Point(Lx, Ly)],
+        [Nx, Ny],
+        df.CellType.Type.triangle,
+        Domain["diag"],
+    )
+    orgmesh = df.RectangleMesh.create(
+        [df.Point(0, 0), df.Point(Lx, Ly)],
+        [Nx, Ny],
+        df.CellType.Type.triangle,
+        Domain["diag"],
+    )
+    finemesh = df.RectangleMesh.create(
+        [df.Point(0, 0), df.Point(Lx, Ly)],
+        [int(Nx*4), int(Ny*4)],
+        df.CellType.Type.quadrilateral,
+    )
+else:
+    imesh = df.BoxMesh.create(
+        [df.Point(0, 0, 0), df.Point(Lx, Ly, Lz)],
+        [Nx, Ny, Nz],
+        df.CellType.Type.tetrahedron,
+    )
+    orgmesh = df.BoxMesh.create(
+        [df.Point(0, 0, 0), df.Point(Lx, Ly, Lz)],
+        [Nx, Ny, Nz],
+        df.CellType.Type.tetrahedron,
+    )
+
+if restartFlag:
+
+    P1, element, ME, nmesh, U, U0, t, dt = io.read_restart(run, dt, nprev, orgmesh, Lx)
+
+    resolution = amr.calc_resolution(emax, emin)
+    imesh = df.Mesh(imesh) #amr.initial_mesh_elect(orgmesh, resolution, emax)
+
+    U0[0].assign(U)
+    P1_fine = df.FiniteElement("Lagrange", finemesh.ufl_cell(), 1)
+
+else:
+
+    P1 = df.FiniteElement("Lagrange", imesh.ufl_cell(), 1)
+    P1_fine = df.FiniteElement("Lagrange", finemesh.ufl_cell(), 1)
+    element = df.MixedElement([P1, P1, P1, P1])
+
+    resolution = amr.calc_resolution(emax, emin)
+    nmesh = amr.initial_mesh(imesh, resolution)
+
+    U, U0, ME = mdf.set_functions(nmesh, Lx, element, nprev)
+    
+    # Create intial conditions and interpolate
+    U_init = InitialConditions(degree=1)
+    U.interpolate(U_init) #error here
+    U0[0].assign(U)
+    
+bcs = []
+bcs = boundaries(nmesh, ME, bcs)
+# Create nonlinear problem and solver
+L, *F = equation_solve(U, U0, ME, nmesh, P1, dt, BDF2, time_bdf2)
+problem = slf.set_problem(L, U, ME, bcs)
+solver = df.PETScSNESSolver()
+
+msize = df.assemble(
+    df.interpolate(df.Constant(1.0), df.FunctionSpace(nmesh, P1)) * df.dx
+)
+
+# Step in time
+
+if not restartFlag:
+
+    t = 0.0
+
+    c_init = df.assemble(U[0] * df.dx)
+
+    stats_df = update_stats(t, dt(0), F, U, None)
+
+    output_stats(nrg_file, stats_df, report=True)
+
+    output_data(t, F, U, fs, P1, nmesh)
+
+    io.disp("├─ Saving initial state:", end=" \n")
+
+    # Write summary record to YAML
+    if hlp.isHead:
+        with open("{}/record.yml".format(run), "w") as fh:
+            yml = ruamel.yaml.YAML(typ=["unsafe", "pytypes"])
+            yml.allow_unicode = True
+            yml.default_flow_style = False
+            yml.explicit_start = True
+            yml.indent(mapping=2, sequence=4, offset=0)
+            yml.dump(record, fh)
+
+# iteraction counter for converged solutions
+iter_s = 1
+
+if BDF2:
+    # generate second condition and redefine problem
+    io.disp("├─ Step 1…")
+    io.disp("├─── BDF2 secondary condition …")
+    eulerStart = time.time()
+
+    L, *F = equation_solve(U, U0, ME, nmesh, P1, dt, False, time_bdf2)
+    problem = slf.set_problem(L, U, ME, bcs)
+
+    BDF2_ini_count = 0
+    converged = False
+
+    while not converged:
+        BDF2_ini_count += 1
+        try:
+            U0[0].assign(U)
+            nits, converged = solver.solve(problem, U.vector())
+        except RuntimeError:
+            converged = False
+
+        if converged:
+            t += dt(0)
+            iter_s += 1
+            time_bdf2[1].assign(time_bdf2[0](0))
+            time_bdf2[0].assign(t)
+        else:
+            dt.assign(dt(0) / 2)  # assign new dt to be half
+            io.disp("Time step DECLINE ===> dt={}".format(dt(0)))
+            U.assign(U0[0])
+
+            if BDF2_ini_count > 10:
+                io.disp("Failed 10× to calculate secondary BDF2 condition")
+                io.disp("==== Terminating Simulation ====")
+                hlp.mpiComm.Abort()
+
+    # Re-define problem and form
+    L, *F = equation_solve(U, U0, ME, nmesh, P1, dt, BDF2, time_bdf2)
+    problem = slf.set_problem(L, U, ME, bcs)
+
+    output_data(t, F, U, fs, P1, nmesh)
+
+    grammar = "try" if BDF2_ini_count == 1 else "tries"
+    timer = time.time() - eulerStart
+
+    io.disp(f"├── {BDF2_ini_count} {grammar} ({nits} iters) in {timer:6.0f} s.")
+
+stats_df = update_stats(t, dt(0), F, U, None)
+
+output_stats(nrg_file, stats_df, report=True)
+timer = time.time() - initStart
+io.disp(f"└─ System Initialized in {timer:.0f} s\n")
+
+# === Evolve the System Microstructure ===
+
+time_to_refine = Adapt["remesh"]
+time_to_refine -= 1
+time_to_print = Interval["domain"]
+time_to_print -= 1
+amrStart = Adapt["amrStart"]
+
+adaptTime = 0
+
+# flag for simulation continuance
+goSim = True
+
+io.disp(f"┌─ Starting the system evolution of microstructure.")
+io.disp(f"│")
+
+flag_interval_output = 0
+
+def apply_predictor(U, U0, mode="linear", iter_s=0, alpha=0.5):
+
+    if mode == "linear": # or (mode == "hybrid" and iter_s < 3):
+        # Formula: 2*Un - Un-1
+        U.vector()[:] = 2.0 * U0[0].vector() - U0[1].vector()
+        #io.disp("│ ├─ Predictor: Linear")
+
+    elif mode == "parabolic" and iter_s >= 3: # or (mode == "hybrid" and iter_s >= 3):
+        # Formula: 3*Un - 3*Un-1 + Un-2
+        # Note: Requires nprev >= 3
+        U.vector()[:] = 3.0 * U0[0].vector() - 3.0 * U0[1].vector() + U0[2].vector()
+        #io.disp("│ ├─ Predictor: Parabolic")
+
+    # Hybrid extrapolation: U_{n+1} = (1-α)*(2*Un - Un-1) + α*(3*Un - 3*Un-1 + Un-2)
+    elif mode == "hybrid" and iter_s >= 3:
+        # Formula: 3*Un - 3*Un-1 + Un-2
+        # Note: Requires nprev >= 3
+        U.vector()[:] = (1 - alpha) * (2.0 * U0[0].vector() - U0[1].vector()) + alpha * (3.0 * U0[0].vector() - 3.0 * U0[1].vector() + U0[2].vector())
+        #io.disp("│ ├─ Predictor: Hybrid")
+
+while goSim:
+    try:
+        step = dt(0)
+
+        if time_to_refine == Adapt["remesh"]:
+            leaf = "┌"
+        elif time_to_refine == 1:
+            leaf = "└"
+        else:
+            leaf = "├"
+
+        io.disp(
+            f"│  {leaf}─ Step {iter_s:<7d}| 𝑡->{t:>10f} / {T:<10f} with Δ𝑡={step:<6f}…"
+        )
+        t += step
+
+        stepStart = time.time()
+
+        for i in range(nprev - 1, 0, -1):
+            U0[i].assign(U0[i - 1])
+
+        U0[0].assign(U)
+
+        if BDF2:
+            for i in range(nprev, 0, -1):
+                time_bdf2[i].assign(time_bdf2[i - 1](0))
+            time_bdf2[0].assign(t)
+
+        apply_predictor(U, U0, mode="linear", iter_s=iter_s, alpha=0.5)
+
+        nits, converged = solver.solve(problem, U.vector())
+        residual = solver.snes().norm
+        iter_s += 1
+
+        stats_df = update_stats(t, step, F, U, stats_df)
+
+        timer = time.time() - stepStart
+        io.disp(
+            f"│  ├───── {timer:6.2f} s: {nits:>2d} iterations, residual={residual::<12g} "
+        )
+
+        time_to_print -= 1
+
+        if time_to_print == 0:
+            time_to_print = Interval["domain"]
+            output_data(t, F, U, fs, P1, nmesh)
+            output_stats(nrg_file, stats_df, report=True)
+
+        if flag_interval_output == 1:
+            flag_interval_output = 0
+            io.disp(f"│ ├─ Writing time interval output")
+        
+            conc = U.split(deepcopy=True)[0]
+            c_print = df.Function(df.FunctionSpace(finemesh, P1_fine)) 
+            df.LagrangeInterpolator.interpolate(c_print,conc)
+            io.write_aux(c_print, t, "c", df.FunctionSpace(finemesh, P1_fine), fs_fine)
+
+            output_data(t, F, U, fs, P1, nmesh)
+            output_stats(nrg_file, stats_df, report=True)
+
+        # Iteration adaptive timestepper
+        if nits == min_its:
+            dt_checkpoint = abs(t%-t_interval_output)
+            if dt_checkpoint > 0 and dt_checkpoint < dt(0) and dt_checkpoint < dt_max:
+                dt.assign(dt_checkpoint)
+                flag_interval_output = 1
+
+        if nits < min_its:
+            dt_checkpoint = abs(t%-t_interval_output)
+            if dt_checkpoint  > 0 and dt_checkpoint < (dt(0)*growth) and dt_checkpoint < dt_max:
+                dt.assign(dt_checkpoint)
+                flag_interval_output = 1
+            else:
+                dt.assign(dt(0) * growth)
+                if dt(0) >= dt_max:
+                    dt.assign(dt_max)
+
+        elif nits > max_its:
+            dt_checkpoint = abs(t%-t_interval_output)
+            if dt_checkpoint > 0 and dt_checkpoint < (dt(0)*cback) and dt_checkpoint < dt_max:
+                dt.assign(dt_checkpoint)
+                flag_interval_output = 1
+            else:
+                dt.assign(dt(0) * cback)
+
+        if iter_s % checkpoint_frequency == 0:
+            io.disp(f"│ ├─ Writing checkpoint")
+            if restartFlag:
+                io.output_restart(restart_run, imesh, nmesh, U, t, dt)
+            else:
+                io.output_restart(run, imesh, nmesh, U, t, dt)
+
+        if iter_s > amrStart or restartFlag == True:
+            time_to_refine -= 1
+            if time_to_refine == 0:
+                time_to_refine = Adapt["remesh"]
+
+                df.MPI.barrier(hlp.mpiComm)
+                io.disp(f"│ ")
+                io.disp(f"│ ┌─      *** Starting remeshing cycle ***")
+
+                adaptStart = time.time()
+
+                Ur = U.copy(deepcopy=True)
+                if BDF2:
+                    Ur0 = U0[0].copy(deepcopy=True)
+
+                io.disp(f"│ ├─      Current solution copied")
+
+                nmesh = amr.refine_coarsen(
+                    Lx, imesh, nmesh, P1, resolution, Ur, Adapt["tol"], Adapt["beta"]
+                )
+
+                # Define functions
+                U, U0, ME = mdf.set_functions(nmesh, Lx, element, nprev)
+
+                io.disp(f"│ ├─      Function space and solution vectors re-defined")
+
+                df.LagrangeInterpolator.interpolate(U, Ur)
+                if BDF2:
+                    df.LagrangeInterpolator.interpolate(U0[0], Ur0)
+
+                io.disp(f"│ ├─      Projection complete")
+
+                bcs = []
+                bcs = boundaries(nmesh, ME, bcs)
+                L, *F = equation_solve(U, U0, ME, nmesh, P1, dt, BDF2, time_bdf2)
+                problem = slf.set_problem(L, U, ME, bcs)
+                solver = df.PETScSNESSolver()
+
+                timer = time.time() - adaptStart
+                io.disp(f"│ ├─      Problem redefined")
+                io.disp(f"│ ├─      Refinement cycle took {timer:5.2g} s")
+                io.disp(f"│ └─      *** Finished remeshing cycle ***")
+                io.disp(f"│ ")
+                df.MPI.barrier(hlp.mpiComm)
+
+                adaptTime += timer
+
+        gc.collect()
+    except:
+        t -= dt(0)
+
+        #time_to_print += 1
+        #flag_interval_output = 0
+
+        io.disp("├─ Failure. {} its, 𝑡-={}".format(nits, dt(0)))
+
+        dt.assign(dt(0) * cback)
+
+        U.vector()[:] = U0[0].vector()
+        for i in range(nprev - 1):
+            U0[i].vector()[:] = U0[i + 1].vector()
+
+        if BDF2:
+            for i in range(nprev):
+                time_bdf2[i].assign(time_bdf2[i + 1](0))
+
+timer = time.time() - startTime
+time_h, time_s = divmod(int(timer), int(3600))
+time_m, time_s = divmod(int(time_s), int(60))
+
+adapttime_h, adapttime_s = divmod(int(adaptTime), int(3600))
+adapttime_m, adapttime_s = divmod(int(adapttime_s), int(60))
+
+io.disp(f"│")
+io.disp(
+    f"├─ Total time spent remeshing {adaptTime:.2f} s or ({adapttime_h:2d}:{adapttime_m:02d}:{adapttime_s:02d})"
+)
+io.disp(
+    f"└─ Simulation took {timer:.2f} s ({time_h:2d}:{time_m:02d}:{time_s:02d}) to reach {t:.2f}"
+)
+# List timings; average across processes in parallel
+df.list_timings(df.TimingClear.keep, [df.TimingType.wall])
