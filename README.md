@@ -11,6 +11,8 @@ Model C: A + displacement field
 
 Model D: chemical and elastic effects within a dilating reference frame
 
+Install FenICS version 1.9
+
 The input parameters are set in config.py
 
 To run model X type the following in the command line:
