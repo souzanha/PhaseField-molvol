@@ -5,7 +5,7 @@ Models A-C assume a uniform, non-dilating lattice-constrained reference frame.
 
 Model A: considers only chemical free energy
 
-Model B: A + isotropic elastic energy
+Model B: A + elastic energy
 
 Model C: A + displacement field
 
